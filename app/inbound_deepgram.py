@@ -347,6 +347,8 @@ async def media_stream(websocket: WebSocket):
             async def twilio_to_deepgram():
                 """Forward audio from Twilio to Deepgram"""
                 nonlocal call_sid, call_metadata
+                audio_chunk_count = 0
+                last_audio_log_time = datetime.utcnow()
 
                 try:
                     while True:
@@ -371,6 +373,7 @@ async def media_stream(websocket: WebSocket):
                             logger.info(f"Call started: {call_sid}")
                             logger.info(f"   From: {mask_phone(call_metadata.get('from'))}")
                             logger.info(f"   To: {mask_phone(call_metadata.get('to'))}")
+                            logger.info(f"   Stream SID: {start_data.get('streamSid')}")
 
                             # Update active calls using TTLDict
                             call_metadata["status"] = "connected"
@@ -388,6 +391,15 @@ async def media_stream(websocket: WebSocket):
                                 # Decode base64 mulaw audio
                                 audio_data = base64.b64decode(payload)
                                 await deepgram_ws.send(audio_data)
+
+                                # Log audio flow periodically (every 2 seconds)
+                                audio_chunk_count += 1
+                                now = datetime.utcnow()
+                                if (now - last_audio_log_time).total_seconds() >= 2:
+                                    logger.info(f"🎤 Audio flowing: {audio_chunk_count} chunks sent to Deepgram")
+                                    last_audio_log_time = now
+                            else:
+                                logger.warning(f"⚠️  Empty audio payload received from Twilio")
 
                         elif event_type == "stop":
                             # Call ended
@@ -446,6 +458,8 @@ async def media_stream(websocket: WebSocket):
             async def deepgram_to_twilio():
                 """Forward audio and transcripts from Deepgram to Twilio"""
                 nonlocal transcript, last_user_speech_time
+                audio_response_count = 0
+                last_audio_response_log = datetime.utcnow()
 
                 try:
                     async for message in deepgram_ws:
@@ -463,10 +477,22 @@ async def media_stream(websocket: WebSocket):
                                 }
                             })
 
+                            # Log audio response periodically
+                            audio_response_count += 1
+                            now = datetime.utcnow()
+                            if (now - last_audio_response_log).total_seconds() >= 2:
+                                logger.info(f"🔊 Audio response: {audio_response_count} chunks sent to Twilio")
+                                last_audio_response_log = now
+
                         else:
                             # JSON message from Deepgram
                             msg_json = json.loads(message)
                             msg_type = msg_json.get("type")
+
+                            # DIAGNOSTIC: Log all message types
+                            logger.info(f"📨 Deepgram message type: {msg_type}")
+                            if msg_type not in ["ConversationText"]:
+                                logger.info(f"   Full message: {json.dumps(msg_json, indent=2)[:500]}")
 
                             if msg_type == "ConversationText":
                                 # Store transcript with size limit
@@ -501,6 +527,16 @@ async def media_stream(websocket: WebSocket):
                                 arguments = msg_json.get("input") or msg_json.get("arguments", {})
 
                                 logger.info(f"🔧 Function call for {call_sid}: {function_name}({arguments})")
+                                logger.info(f"   Function ID: {function_id}")
+                                logger.info(f"   Full message: {json.dumps(msg_json, indent=2)}")
+
+                                # CRITICAL: Validate function_id before proceeding
+                                if not function_id:
+                                    logger.error(f"❌ CRITICAL: No function_id found in FunctionCallRequest! Keys: {list(msg_json.keys())}")
+                                    logger.error(f"   Full message: {msg_json}")
+                                    # Try to recover by using a generated ID
+                                    function_id = f"generated_{datetime.utcnow().timestamp()}"
+                                    logger.warning(f"   Using generated ID: {function_id}")
 
                                 try:
                                     # Execute the function using call_sid as session_id
@@ -510,12 +546,17 @@ async def media_stream(websocket: WebSocket):
                                         session_id=call_sid
                                     )
 
-                                    # Send response back to Deepgram
+                                    logger.info(f"   Function result: {result}")
+
+                                    # CRITICAL: Deepgram expects "output" to be a STRING containing JSON
+                                    # The "speak" field should be at the top level of the output JSON
                                     response = {
                                         "type": "FunctionCallResponse",
                                         "function_call_id": function_id,
                                         "output": json.dumps(result)
                                     }
+
+                                    logger.info(f"   Sending FunctionCallResponse: {json.dumps(response, indent=2)}")
                                     await deepgram_ws.send(json.dumps(response))
                                     logger.info(f"✅ Function response sent for {call_sid}: {result.get('speak', 'no speak')[:50]}...")
 
@@ -526,20 +567,25 @@ async def media_stream(websocket: WebSocket):
                                             "content": f"{function_name}: {result.get('speak', '')}",
                                             "timestamp": datetime.utcnow().isoformat()
                                         })
-                                    
+
                                     # Track assistant response in context
                                     if call_sid:
                                         context = get_context(call_sid)
                                         context.add_turn("assistant", result.get('speak', ''))
 
                                 except Exception as e:
-                                    logger.error(f"❌ Function execution error for {call_sid}: {e}")
-                                    # Send error response
+                                    logger.error(f"❌ Function execution error for {call_sid}: {e}", exc_info=True)
+                                    logger.error(f"   Function name: {function_name}")
+                                    logger.error(f"   Arguments: {arguments}")
+                                    logger.error(f"   Call SID: {call_sid}")
+
+                                    # Send error response - MUST include function_call_id
                                     error_response = {
                                         "type": "FunctionCallResponse",
                                         "function_call_id": function_id,
                                         "output": json.dumps({"speak": "I'm sorry, something went wrong. Could you try again?"})
                                     }
+                                    logger.info(f"   Sending error FunctionCallResponse: {json.dumps(error_response)}")
                                     await deepgram_ws.send(json.dumps(error_response))
 
                             elif msg_type == "Error":
