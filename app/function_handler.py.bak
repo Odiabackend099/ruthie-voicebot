@@ -1,0 +1,448 @@
+"""
+Function Handler for Deepgram Agent API
+Handles function call execution with session state tracking.
+
+This module processes FunctionCallRequest messages from Deepgram,
+maintains conversation state per session, and returns appropriate
+prompts to guide the AI through sequential parameter collection.
+"""
+
+import logging
+import random
+from typing import Dict, Any, Optional
+from datetime import datetime
+from app.function_definitions import FUNCTION_FLOWS
+from app.tts_sanitizer import sanitize_for_tts, validate_template_variables
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# SESSION STATE STORAGE
+# In production, consider using Redis for persistence across restarts
+# =============================================================================
+
+session_states: Dict[str, Dict[str, Any]] = {}
+
+# =============================================================================
+# COLLECTION PROMPTS - What to say after each parameter is collected
+# =============================================================================
+
+COLLECTION_PROMPTS = {
+    "booking": {
+        "start": "I'd be happy to help you book an appointment! May I have your name please?",
+        "after_name": "Thanks, {client_name}! What email should I send the confirmation to?",
+        "after_email": "Perfect. What's the best phone number to reach you at?",
+        "after_phone": "Thanks! And what's the name of your company?",
+        "after_company": "Got it, {company_name}. Now, what date works best for you?",
+        "after_date": "Great, {booking_date}. And what time would you prefer?",
+        "after_time": "{booking_time} works! What type of service are you looking for?",
+        "after_service": "Got it, a {service_type}. Last question - briefly, what's the main purpose of this appointment?",
+        "confirm": "Let me confirm: I have a {service_type} appointment for {client_name} from {company_name} on {booking_date} at {booking_time}. Confirmation goes to {client_email} and {client_phone}, and we'll discuss {purpose}. Does that sound right?",
+        "success": "Your appointment is confirmed for {booking_date} at {booking_time}. You'll receive a confirmation email at {client_email} shortly. Is there anything else I can help with?",
+        "error": "I'm sorry, there was an issue booking your appointment. Would you like me to try again, or connect you with our team?",
+    },
+    "reschedule": {
+        "start": "I can help you reschedule. What email is your booking under?",
+        "after_email": "Got it, {client_email}. What new date would you prefer?",
+        "after_date": "And what time works on {new_date}?",
+        "confirm": "I'll reschedule your appointment to {new_date} at {new_time}. Should I go ahead?",
+        "success": "Done! Your appointment has been moved to {new_date} at {new_time}. You'll get an updated confirmation email. Anything else?",
+        "error": "I'm sorry, I couldn't find a booking with that email. Could you double-check the email address?",
+    },
+    "cancel": {
+        "start": "I'm sorry you need to cancel. What email is your booking under?",
+        "after_email": "I found your booking. Are you sure you want to cancel? I could also reschedule if you'd prefer.",
+        "confirm": "I found your booking. Are you sure you want to cancel? I could also reschedule if you'd prefer.",
+        "success": "Your appointment has been cancelled. You'll receive a confirmation email. Is there anything else I can help with?",
+        "error": "I couldn't find a booking with that email. Could you double-check the email address?",
+    },
+    "email": {
+        "start": "Sure, I can help send an email. What's the recipient's email address?",
+        "after_to": "Got it. What should the subject line be?",
+        "after_subject": "And what would you like the email to say?",
+        "confirm": "I'll send an email to {to} with subject '{subject}'. Ready to send?",
+        "success": "Email sent to {to}! Anything else I can help with?",
+        "error": "I'm sorry, there was an issue sending the email. Would you like me to try again?",
+    },
+    "sms": {
+        "start": "I can send an SMS for you. What phone number should I text? Please include the country code like +234 for Nigeria or +1 for US.",
+        "after_phone": "Got it, {to}. What message would you like to send?",
+        "confirm": "I'll text {to} saying: '{message}'. Should I send it?",
+        "success": "SMS sent to {to}! Anything else?",
+        "error": "I couldn't send that SMS. Please check the phone number format and try again.",
+    },
+    "whatsapp": {
+        "start": "I can send a WhatsApp message. What's the phone number? Include the country code.",
+        "after_phone": "Perfect, {to}. What message would you like to send?",
+        "confirm": "I'll WhatsApp {to} with your message. Ready to send?",
+        "success": "WhatsApp message sent to {to}! Anything else?",
+        "error": "I couldn't send that WhatsApp message. Please check the phone number and try again.",
+    },
+}
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def get_session(session_id: str) -> Dict[str, Any]:
+    """Get or create session state for a given session ID."""
+    if session_id not in session_states:
+        session_states[session_id] = {
+            "flow": None,
+            "params": {},
+            "created_at": datetime.utcnow().isoformat(),
+        }
+    return session_states[session_id]
+
+
+def clear_session(session_id: str):
+    """Clear session state after action is completed."""
+    if session_id in session_states:
+        del session_states[session_id]
+        logger.info(f"Cleared session state for {session_id}")
+
+
+def format_prompt(template: str, params: Dict[str, Any]) -> str:
+    """
+    Safely format a prompt template with collected parameters.
+    Uses TTS sanitization to prevent technical artifacts.
+    """
+    # Use the new sanitized template validator
+    formatted = validate_template_variables(template, params)
+    # Apply TTS sanitization
+    sanitized = sanitize_for_tts(formatted)
+    return sanitized
+
+
+# =============================================================================
+# MAIN FUNCTION HANDLER
+# =============================================================================
+
+async def handle_function_call(
+    function_name: str,
+    arguments: Dict[str, Any],
+    session_id: str
+) -> Dict[str, Any]:
+    """
+    Process a function call from Deepgram Agent.
+
+    Args:
+        function_name: Name of the function being called
+        arguments: Parameters passed to the function
+        session_id: Unique identifier for this call/session
+
+    Returns:
+        Dict with either:
+        - {"speak": "message"} - What the AI should say next
+        - {"result": data} - Result from an action execution
+    """
+    logger.info(f"Function call: {function_name}({arguments}) for session {session_id}")
+
+    session = get_session(session_id)
+    flow = FUNCTION_FLOWS.get(function_name, "unknown")
+
+    # Import n8n_client here to avoid circular imports
+    from app import n8n_client
+
+    # =========================================================================
+    # BOOKING FLOW
+    # =========================================================================
+
+    if function_name == "initiate_booking":
+        session["flow"] = "booking"
+        session["params"] = {}
+        return {"speak": sanitize_for_tts(COLLECTION_PROMPTS["booking"]["start"])}
+
+    elif function_name == "collect_client_name":
+        session["params"]["client_name"] = arguments.get("client_name", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["after_name"], session["params"])}
+
+    elif function_name == "collect_client_email":
+        session["params"]["client_email"] = arguments.get("client_email", "")
+        return {"speak": sanitize_for_tts(COLLECTION_PROMPTS["booking"]["after_email"])}
+
+    elif function_name == "collect_client_phone":
+        session["params"]["client_phone"] = arguments.get("client_phone", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["after_phone"], session["params"])}
+
+    elif function_name == "collect_company_name":
+        session["params"]["company_name"] = arguments.get("company_name", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["after_company"], session["params"])}
+
+    elif function_name == "collect_booking_date":
+        session["params"]["booking_date"] = arguments.get("booking_date", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["after_date"], session["params"])}
+
+    elif function_name == "collect_booking_time":
+        session["params"]["booking_time"] = arguments.get("booking_time", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["after_time"], session["params"])}
+
+    elif function_name == "collect_service_type":
+        session["params"]["service_type"] = arguments.get("service_type", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["after_service"], session["params"])}
+
+    elif function_name == "collect_purpose":
+        session["params"]["purpose"] = arguments.get("purpose", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["confirm"], session["params"])}
+
+    elif function_name == "confirm_and_book":
+        try:
+            result = await n8n_client.book_appointment(
+                session_id=session_id,
+                client_name=arguments.get("client_name"),
+                client_email=arguments.get("client_email"),
+                client_phone=arguments.get("client_phone"),
+                company_name=arguments.get("company_name"),
+                booking_date=arguments.get("booking_date"),
+                booking_time=arguments.get("booking_time"),
+                service_type=arguments.get("service_type"),
+                purpose=arguments.get("purpose"),
+            )
+            clear_session(session_id)
+
+            if result.get("success"):
+                return {"speak": format_prompt(COLLECTION_PROMPTS["booking"]["success"], arguments)}
+            else:
+                return {"speak": COLLECTION_PROMPTS["booking"]["error"]}
+        except Exception as e:
+            logger.error(f"Booking error: {e}")
+            return {"speak": COLLECTION_PROMPTS["booking"]["error"]}
+
+    # =========================================================================
+    # RESCHEDULE FLOW
+    # =========================================================================
+
+    elif function_name == "initiate_reschedule":
+        session["flow"] = "reschedule"
+        session["params"] = {}
+        return {"speak": COLLECTION_PROMPTS["reschedule"]["start"]}
+
+    elif function_name == "collect_reschedule_email":
+        session["params"]["client_email"] = arguments.get("client_email", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["reschedule"]["after_email"], session["params"])}
+
+    elif function_name == "collect_new_date":
+        session["params"]["new_date"] = arguments.get("new_date", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["reschedule"]["after_date"], session["params"])}
+
+    elif function_name == "collect_new_time":
+        session["params"]["new_time"] = arguments.get("new_time", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["reschedule"]["confirm"], session["params"])}
+
+    elif function_name == "confirm_and_reschedule":
+        try:
+            result = await n8n_client.reschedule_appointment(
+                session_id=session_id,
+                client_email=arguments.get("client_email"),
+                new_date=arguments.get("new_date"),
+                new_time=arguments.get("new_time"),
+            )
+            clear_session(session_id)
+
+            if result.get("success"):
+                return {"speak": format_prompt(COLLECTION_PROMPTS["reschedule"]["success"], arguments)}
+            else:
+                return {"speak": COLLECTION_PROMPTS["reschedule"]["error"]}
+        except Exception as e:
+            logger.error(f"Reschedule error: {e}")
+            return {"speak": COLLECTION_PROMPTS["reschedule"]["error"]}
+
+    # =========================================================================
+    # CANCEL FLOW
+    # =========================================================================
+
+    elif function_name == "initiate_cancel":
+        session["flow"] = "cancel"
+        session["params"] = {}
+        return {"speak": COLLECTION_PROMPTS["cancel"]["start"]}
+
+    elif function_name == "collect_cancel_email":
+        session["params"]["client_email"] = arguments.get("client_email", "")
+        return {"speak": COLLECTION_PROMPTS["cancel"]["after_email"]}
+
+    elif function_name == "confirm_and_cancel":
+        try:
+            result = await n8n_client.cancel_appointment(
+                session_id=session_id,
+                client_email=arguments.get("client_email"),
+            )
+            clear_session(session_id)
+
+            if result.get("success"):
+                return {"speak": COLLECTION_PROMPTS["cancel"]["success"]}
+            else:
+                return {"speak": COLLECTION_PROMPTS["cancel"]["error"]}
+        except Exception as e:
+            logger.error(f"Cancel error: {e}")
+            return {"speak": COLLECTION_PROMPTS["cancel"]["error"]}
+
+    # =========================================================================
+    # EMAIL FLOW
+    # =========================================================================
+
+    elif function_name == "initiate_email":
+        session["flow"] = "email"
+        session["params"] = {}
+        return {"speak": COLLECTION_PROMPTS["email"]["start"]}
+
+    elif function_name == "collect_email_recipient":
+        session["params"]["to"] = arguments.get("to", "")
+        return {"speak": COLLECTION_PROMPTS["email"]["after_to"]}
+
+    elif function_name == "collect_email_subject":
+        session["params"]["subject"] = arguments.get("subject", "")
+        return {"speak": COLLECTION_PROMPTS["email"]["after_subject"]}
+
+    elif function_name == "collect_email_message":
+        session["params"]["message"] = arguments.get("message", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["email"]["confirm"], session["params"])}
+
+    elif function_name == "confirm_and_send_email":
+        try:
+            result = await n8n_client.send_email(
+                session_id=session_id,
+                to=arguments.get("to"),
+                subject=arguments.get("subject"),
+                message=arguments.get("message"),
+            )
+            clear_session(session_id)
+
+            if result.get("success"):
+                return {"speak": format_prompt(COLLECTION_PROMPTS["email"]["success"], arguments)}
+            else:
+                return {"speak": COLLECTION_PROMPTS["email"]["error"]}
+        except Exception as e:
+            logger.error(f"Email error: {e}")
+            return {"speak": COLLECTION_PROMPTS["email"]["error"]}
+
+    # =========================================================================
+    # SMS FLOW
+    # =========================================================================
+
+    elif function_name == "initiate_sms":
+        session["flow"] = "sms"
+        session["params"] = {}
+        return {"speak": COLLECTION_PROMPTS["sms"]["start"]}
+
+    elif function_name == "collect_sms_phone":
+        session["params"]["to"] = arguments.get("to", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["sms"]["after_phone"], session["params"])}
+
+    elif function_name == "collect_sms_message":
+        session["params"]["message"] = arguments.get("message", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["sms"]["confirm"], session["params"])}
+
+    elif function_name == "confirm_and_send_sms":
+        try:
+            result = await n8n_client.send_sms(
+                session_id=session_id,
+                to=arguments.get("to"),
+                message=arguments.get("message"),
+            )
+            clear_session(session_id)
+
+            if result.get("success"):
+                return {"speak": format_prompt(COLLECTION_PROMPTS["sms"]["success"], arguments)}
+            else:
+                return {"speak": COLLECTION_PROMPTS["sms"]["error"]}
+        except Exception as e:
+            logger.error(f"SMS error: {e}")
+            return {"speak": COLLECTION_PROMPTS["sms"]["error"]}
+
+    # =========================================================================
+    # WHATSAPP FLOW
+    # =========================================================================
+
+    elif function_name == "initiate_whatsapp":
+        session["flow"] = "whatsapp"
+        session["params"] = {}
+        return {"speak": COLLECTION_PROMPTS["whatsapp"]["start"]}
+
+    elif function_name == "collect_whatsapp_phone":
+        session["params"]["to"] = arguments.get("to", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["whatsapp"]["after_phone"], session["params"])}
+
+    elif function_name == "collect_whatsapp_message":
+        session["params"]["message"] = arguments.get("message", "")
+        return {"speak": format_prompt(COLLECTION_PROMPTS["whatsapp"]["confirm"], session["params"])}
+
+    elif function_name == "confirm_and_send_whatsapp":
+        try:
+            result = await n8n_client.send_whatsapp(
+                session_id=session_id,
+                to=arguments.get("to"),
+                message=arguments.get("message"),
+            )
+            clear_session(session_id)
+
+            if result.get("success"):
+                return {"speak": format_prompt(COLLECTION_PROMPTS["whatsapp"]["success"], arguments)}
+            else:
+                return {"speak": COLLECTION_PROMPTS["whatsapp"]["error"]}
+        except Exception as e:
+            logger.error(f"WhatsApp error: {e}")
+            return {"speak": COLLECTION_PROMPTS["whatsapp"]["error"]}
+
+    # =========================================================================
+    # SIMPLE ACTIONS (no state needed)
+    # =========================================================================
+
+    elif function_name == "search_web":
+        try:
+            result = await n8n_client.search_web(
+                session_id=session_id,
+                query=arguments.get("query", ""),
+            )
+            if result.get("success"):
+                search_results = result.get("data", {})
+                return {"speak": f"Here's what I found: {search_results}", "result": search_results}
+            else:
+                return {"speak": "I'm sorry, I couldn't complete that search. Please try again."}
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            return {"speak": "I'm having trouble searching right now. Please try again later."}
+
+    elif function_name == "get_current_datetime":
+        try:
+            result = await n8n_client.get_current_datetime(session_id=session_id)
+            if result.get("success"):
+                dt_info = result.get("data", {})
+                current_dt = dt_info.get("currentDateTime", "unknown")
+                return {"speak": f"The current date and time is {current_dt}.", "result": dt_info}
+            else:
+                # Fallback to local time
+                now = datetime.now()
+                return {"speak": f"The current date and time is {now.strftime('%B %d, %Y at %I:%M %p')}."}
+        except Exception as e:
+            logger.error(f"Datetime error: {e}")
+            now = datetime.now()
+            return {"speak": f"The current date and time is {now.strftime('%B %d, %Y at %I:%M %p')}."}
+
+    elif function_name == "get_location_info":
+        try:
+            result = await n8n_client.get_location_info(session_id=session_id)
+            if result.get("success"):
+                location = result.get("data", {})
+                city = location.get("city", "Ruislip, London")
+                address = location.get("address", "College House, 2nd Floor, 17 King Edwards Road, Ruislip, London HA4 7AE, United Kingdom")
+                hours = location.get("business_hours", "Monday to Friday, 9 AM to 5 PM GMT")
+                return {
+                    "speak": f"Our registered office is located at {address}. We're open {hours}. Is there anything specific you'd like to know?",
+                    "result": location
+                }
+            else:
+                # Fallback with official registered office address
+                return {"speak": "Our registered office is located at College House, 2nd Floor, 17 King Edwards Road, Ruislip, London HA4 7AE, United Kingdom. We're open Monday to Friday, 9 AM to 5 PM GMT. You can also email us at hello@odia.dev."}
+        except Exception as e:
+            logger.error(f"Location error: {e}")
+            # Fallback with official registered office address
+            return {"speak": "Our registered office is located at College House, 2nd Floor, 17 King Edwards Road, Ruislip, London HA4 7AE, United Kingdom. We're open Monday to Friday, 9 AM to 5 PM GMT. You can also email us at hello@odia.dev."}
+
+
+    # =========================================================================
+    # UNKNOWN FUNCTION
+    # =========================================================================
+
+    else:
+        logger.warning(f"Unknown function called: {function_name}")
+        return {"speak": "I'm not sure how to help with that. Could you please rephrase?"}

@@ -1,22 +1,36 @@
-# Base image
-FROM vocodedev/vocode:latest
+# Use official Python runtime as base image
+FROM python:3.11-slim
 
 # Set working directory
-WORKDIR /code
+WORKDIR /app
 
-# Copy dependency files
-COPY pyproject.toml poetry.lock ./
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-RUN pip install --no-cache-dir --upgrade poetry && \
-    poetry config virtualenvs.create false && \
-    poetry install --no-dev --no-interaction --no-ansi
+# Copy requirements first for better caching
+COPY requirements.txt .
 
-# Copy application files
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
 COPY app ./app
 
-# Expose the ports the app runs on
-EXPOSE 3000 8000
+# Copy knowledge base
+COPY knowledge_base ./knowledge_base
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8080/health')" || exit 1
 
 # Run the application
-CMD ["uvicorn", "app.inbound:app", "--host", "0.0.0.0", "--port", "3000"]
+CMD ["uvicorn", "app.main_ws:app", "--host", "0.0.0.0", "--port", "8080"]

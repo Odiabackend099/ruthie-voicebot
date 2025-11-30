@@ -4,11 +4,25 @@ from vocode.streaming.models.events import (
 )
 from vocode.streaming.utils.events_manager import EventsManager
 from loguru import logger
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, REGISTRY
 
-# Create Prometheus metrics
-SESSION_COUNTER = Counter('voicebot_session_count', 'Number of sessions started')
-SESSION_GAUGE = Gauge('voicebot_active_sessions', 'Current number of active sessions')
+
+def mask_phone(phone: str) -> str:
+    """Mask phone number for logging - only show last 4 digits"""
+    if phone and len(phone) >= 4:
+        return f"***{phone[-4:]}"
+    return "***"
+
+# Create Prometheus metrics safely
+try:
+    SESSION_COUNTER = Counter('voicebot_session_count', 'Number of sessions started')
+except ValueError:
+    SESSION_COUNTER = REGISTRY._names_to_collectors['voicebot_session_count']
+
+try:
+    SESSION_GAUGE = Gauge('voicebot_active_sessions', 'Current number of active sessions')
+except ValueError:
+    SESSION_GAUGE = REGISTRY._names_to_collectors['voicebot_active_sessions']
 
 class VoiceBotEventsManager(EventsManager):
     async def handle_event(self, event: Event):
@@ -20,7 +34,7 @@ class VoiceBotEventsManager(EventsManager):
             logger.info(f"Transcript complete: {event.text}")
         elif event.type == EventType.PHONE_CALL_CONNECTED:
             phone_call_event = event  # type: PhoneCallConnectedEvent
-            logger.info(f"Phone call connected: from {phone_call_event.from_phone_number} to {phone_call_event.to_phone_number}")
+            logger.info(f"Phone call connected: from {mask_phone(phone_call_event.from_phone_number)} to {mask_phone(phone_call_event.to_phone_number)}")
             SESSION_COUNTER.inc()
             SESSION_GAUGE.inc()
             logger.info(f"📞 Session started. Active sessions: {SESSION_GAUGE._value.get()}")
